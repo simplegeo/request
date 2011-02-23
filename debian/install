@@ -1,1 +1,2 @@
-request.js /usr/lib/nodejs
+index.js /usr/lib/nodejs/request
+main.js /usr/lib/nodejs/request
