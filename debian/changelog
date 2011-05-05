@@ -1,3 +1,8 @@
+nodejs-request (1.9.5-0sg0) unstable; urgency=low
+
+  * New upstream release
+
+ -- Wade Simmons <wade@simplegeo.com>  Thu, 05 May 2011 16:18:40 +0000
 nodejs-request (1.2.0-0sg3) UNRELEASED; urgency=low
 
   [ Wade Simmons ]
