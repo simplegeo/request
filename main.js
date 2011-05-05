@@ -13,19 +13,67 @@
 //    limitations under the License.
 
 var http = require('http')
+  , https = false
+  , tls = false
   , url = require('url')
-  , sys = require('sys')
+  , util = require('util')
+  , stream = require('stream')
   , qs = require('querystring')
   ;
+
+try {
+    https = require('https');
+} catch (e) {}
+
+try {
+    tls = require('tls');
+} catch (e) {}
 
 var toBase64 = function(str) {
   return (new Buffer(str || "", "ascii")).toString("base64");
 };
 
+// Hacky fix for pre-0.4.4 https
+if (https && !https.Agent) {
+  https.Agent = function (options) {
+    http.Agent.call(this, options);
+  }
+  util.inherits(https.Agent, http.Agent);
+
+  https.Agent.prototype._getConnection = function(host, port, cb) {
+    var s = tls.connect(port, host, this.options, function() {
+      // do other checks here?
+      if (cb) cb();
+    });
+
+    return s;
+  };
+}
+
 var isUrl = /^https?:/;
 
-function request (options, callback) {
-  if (!options.callback) options.callback = callback;
+var globalPool = {};
+
+var Request = function (options) {
+  stream.Stream.call(this);
+  this.readable = true;
+  this.writable = true;
+  
+  for (i in options) {
+    this[i] = options[i];
+  }
+  if (!this.pool) this.pool = globalPool;
+  this.dests = [];
+}
+util.inherits(Request, stream.Stream);
+Request.prototype.getAgent = function (host, port) {
+  if (!this.pool[host+':'+port]) {
+    this.pool[host+':'+port] = new this.httpModule.Agent({host:host, port:port});
+  }
+  return this.pool[host+':'+port];
+}
+Request.prototype.request = function () {  
+  var options = this;
   if (options.url) {
     // People use this property instead all the time so why not just support it.
     options.uri = options.url;
@@ -65,29 +113,31 @@ function request (options, callback) {
     else if (options.uri.protocol == 'https:') {options.uri.port = 443;}
   }
 
-  if (options.bodyStream) {
-    sys.error('options.bodyStream is deprecated. use options.reponseBodyStream instead.');
-    options.responseBodyStream = options.bodyStream;
+  if (options.bodyStream || options.responseBodyStream) {
+    console.error('options.bodyStream and options.responseBodyStream is deprecated. You should now send the request object to stream.pipe()');
+    this.pipe(options.responseBodyStream || options.bodyStream)
   }
-  if (!options.client) {
-    if (options.proxy) {
-      options.client = http.createClient(options.proxy.port, options.proxy.hostname, options.proxy.protocol === 'https:');
-    } else {
-      options.client = http.createClient(options.uri.port, options.uri.hostname, options.uri.protocol === 'https:');
-    }
+  
+  if (options.proxy) {
+    options.port = options.proxy.port;
+    options.host = options.proxy.hostname;
+  } else {
+    options.port = options.uri.port;
+    options.host = options.uri.hostname;
   }
   
   if (options.onResponse === true) {
     options.onResponse = options.callback;
     delete options.callback;
   }
-
+  
   var clientErrorHandler = function (error) {
     if (setHost) delete options.headers.host;
-    if (options.onResponse) options.onResponse(error); 
-    if (options.callback) options.callback(error);
+    options.emit('error', error);
   };
-  options.client.addListener('error', clientErrorHandler);
+  if (options.onResponse) options.on('error', function (e) {options.onResponse(e)}); 
+  if (options.callback) options.on('error', function (e) {options.callback(e)});
+  
 
   if (options.uri.auth && !options.headers.authorization) {
     options.headers.authorization = "Basic " + toBase64(options.uri.auth.split(':').map(qs.unescape).join(':'));
@@ -96,10 +146,10 @@ function request (options, callback) {
     options.headers['proxy-authorization'] = "Basic " + toBase64(options.proxy.auth.split(':').map(qs.unescape).join(':'));
   }
 
-  options.fullpath = options.uri.href.replace(options.uri.protocol + '//' + options.uri.host, '');
-  if (options.fullpath.length === 0) options.fullpath = '/';
+  options.path = options.uri.href.replace(options.uri.protocol + '//' + options.uri.host, '');
+  if (options.path.length === 0) options.path = '/';
 
-  if (options.proxy) options.fullpath = (options.uri.protocol + '//' + options.uri.host + options.fullpath);
+  if (options.proxy) options.path = (options.uri.protocol + '//' + options.uri.host + options.path);
 
   if (options.json) {
     options.headers['content-type'] = 'application/json';
@@ -132,27 +182,45 @@ function request (options, callback) {
       throw new Error('Argument error, options.body.');
     }
   }
+  
+  options.httpModule = 
+    {"http:":http, "https:":https}[options.proxy ? options.proxy.protocol : options.uri.protocol]
 
-  options.request = options.client.request(options.method, options.fullpath, options.headers);
-  options.request.addListener("response", function (response) {
+  if (!options.httpModule) throw new Error("Invalid protocol");
+  
+  if (options.pool === false) {
+    options.agent = false;
+  } else {
+    if (options.maxSockets) {
+      options.agent = options.getAgent(options.host, options.port);
+      options.agent.maxSockets = options.maxSockets;
+    }
+    if (options.pool.maxSockets) {
+      options.agent = options.getAgent(options.host, options.port);
+      options.agent.maxSockets = options.pool.maxSockets;
+    }
+  }
+
+  options.req = options.httpModule.request(options, function (response) {
+    options.response = response;
     if (setHost) delete options.headers.host;
-    response.on("end", function () {
-      options.client.removeListener("error", clientErrorHandler);
-    });
-
+    
     if (response.statusCode >= 300 && 
         response.statusCode < 400  && 
         options.followRedirect     && 
+        options.method !== 'PUT' && 
+        options.method !== 'POST' &&
         response.headers.location) {
       if (options._redirectsFollowed >= options.maxRedirects) {
-        client.emit('error', new Error("Exceeded maxRedirects. Probably stuck in a redirect loop."));
+        options.emit('error', new Error("Exceeded maxRedirects. Probably stuck in a redirect loop."));
       }
       options._redirectsFollowed += 1;
       if (!isUrl.test(response.headers.location)) {
         response.headers.location = url.resolve(options.uri.href, response.headers.location);
       }
       options.uri = response.headers.location;
-      delete options.client;
+      delete options.req;
+      delete options.agent;
       if (options.headers) {
         delete options.headers.host;
       }
@@ -160,57 +228,132 @@ function request (options, callback) {
       return; // Ignore the rest of the response
     } else {
       options._redirectsFollowed = 0;
-      if (options.encoding) response.setEncoding(options.encoding);
-      if (options.responseBodyStream) {
-        sys.pump(response, options.responseBodyStream);
+      // Be a good stream and emit end when the response is finished.
+      // Hack to emit end on close becuase of a core bug that never fires end
+      response.on('close', function () {options.emit('end')})
+      
+      if (options.encoding) {
+        if (options.dests.length !== 0) {
+          console.error("Ingoring encoding parameter as this stream is being piped to another stream which makes the encoding option invalid.");
+        } else {
+          response.setEncoding(options.encoding);
+        }
+      }
+      
+      if (options.dests.length !== 0) {
+        options.dests.forEach(function (dest) {
+          response.pipe(dest);
+        })
         if (options.onResponse) options.onResponse(null, response);
         if (options.callback) options.callback(null, response, options.responseBodyStream);
+        
       } else {
         if (options.onResponse) {
           options.onResponse(null, response);
         }
         if (options.callback) {
           var buffer = '';
-          response
-          .on("data", function (chunk) { buffer += chunk; })
-          .on("end", function () { options.callback(null, response, buffer); })
+          response.on("data", function (chunk) { 
+            buffer += chunk; 
+          })
+          response.on("end", function () { 
+            options.callback(null, response, buffer); 
+          })
           ;
         }
       }
     }
-  });
+  })
+  
+  options.req.on('error', clientErrorHandler);
+    
+  options.once('pipe', function (src) {
+    if (options.ntick) throw new Error("You cannot pipe to this stream after the first nextTick() after creation of the request stream.")
+    options.src = src;
+    options.on('pipe', function () {
+      console.error("You have already piped to this stream. Pipeing twice is likely to break the request.")
+    })
+  })
+  
+  process.nextTick(function () {
+    if (options.body) {
+      options.req.write(options.body);
+      options.req.end();
+    } else if (options.requestBodyStream) {
+      console.warn("options.requestBodyStream is deprecated, please pass the request object to stream.pipe.")
+      options.requestBodyStream.pipe(options);
+    } else if (!options.src) {
+      options.req.end();
+    }
+    options.ntick = true;
+  })
+}
+Request.prototype.pipe = function (dest) {
+  if (this.response) throw new Error("You cannot pipe after the response event.")
+  this.dests.push(dest);
+}
+Request.prototype.write = function () {
+  if (!this.req) throw new Error("This request has been piped before http.request() was called.");
+  this.req.write.apply(this.req, arguments);
+}
+Request.prototype.end = function () {
+  if (!this.req) throw new Error("This request has been piped before http.request() was called.");
+  this.req.end.apply(this.req, arguments);
+}
+Request.prototype.pause = function () {
+  if (!this.req) throw new Error("This request has been piped before http.request() was called.");
+  this.req.pause.apply(this.req, arguments);
+}
+Request.prototype.resume = function () {
+  if (!this.req) throw new Error("This request has been piped before http.request() was called.");
+  this.req.resume.apply(this.req, arguments);
+}
 
-  if (options.body) {
-    options.request.write(options.body);
-    options.request.end();
-  } else if (options.requestBodyStream) {
-    sys.pump(options.requestBodyStream, options.request);
-  } else {
-    options.request.end();
-  }
+function request (options, callback) {
+  if (callback) options.callback = callback;
+  var r = new Request(options);
+  r.request();
+  return r;
 }
 
 module.exports = request;
 
+request.defaults = function (options) {
+  var def = function (method) {
+    var d = function (opts, callback) {
+      for (i in options) {
+        if (!opts[i]) opts[i] = options[i];
+        return method(opts, callback);
+      }
+    }
+    return d;
+  }
+  de = def(request);
+  de.get = def(request.get);
+  de.post = def(request.post);
+  de.put = def(request.put);
+  de.head = def(request.head);
+  de.del = def(request.del);
+  return d;
+}
+
 request.get = request;
 request.post = function (options, callback) {
-  options.method = 'POST'; 
-  if (!options.body && !options.requestBodyStream && !options.json && !options.multipart) {
-    sys.error("HTTP POST requests need a body or requestBodyStream");
-  }
-  request(options, callback);
+  options.method = 'POST';
+  return request(options, callback);
 };
 request.put = function (options, callback) {
-  options.method = 'PUT'; 
-  if (!options.body && !options.requestBodyStream && !options.json && !options.multipart) {
-    sys.error("HTTP PUT requests need a body or requestBodyStream");
-  }
-  request(options, callback);
+  options.method = 'PUT';
+  return request(options, callback);
 };
 request.head = function (options, callback) {
-  options.method = 'HEAD'; 
+  options.method = 'HEAD';
   if (options.body || options.requestBodyStream || options.json || options.multipart) {
     throw new Error("HTTP HEAD requests MUST NOT include a request body.");
   }
-  request(options, callback);
+  return request(options, callback);
 };
+request.del = function (options, callback) {
+  options.method = 'DELETE';
+  return request(options, callback);
+}
